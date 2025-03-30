@@ -56,6 +56,9 @@ class Server(object):
 			"method":"Shelly.GetDeviceInfo"
 		}))
 
+		# Queue for messages received before GetDeviceInfo response
+		queue = []
+
 		while not m.destroyed:
 			# Decode data, and dispatch it to the gevent mainloop
 			try:
@@ -72,8 +75,18 @@ class Server(object):
 						logger.info("Failed to start meter for " + str(socket.remote_address))
 						m.destroy()
 						break
+
+					# Process queued messages and clear queue
+					for data in queue:
+						logger.debug("Processing queued message")
+						await m.update(data)
+					queue = None
 				else:
-					await m.update(data)
+					if queue is not None:
+						logger.debug("Enqueuing message")
+						queue.append(data)
+					else:
+						await m.update(data)
 
 		del self.meters[socket.remote_address]
 
