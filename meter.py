@@ -86,8 +86,13 @@ class Meter(object):
 
 		logger.info("Connected to localsettings")
 
+		role = "grid"
+		# default to acload for PM relays with models like S1PM
+		if model and len(model) >= 4 and model[2:4] == "PM":
+			role = "acload"
+
 		await settings.add_settings(
-			Setting(self.settings_paths["instance"], f"grid:40", 0, 0),
+			Setting(self.settings_paths["instance"], f"{role}:40", 0, 0),
 			Setting(self.settings_paths["position"], 0, 0, 2),
 			Setting(self.settings_paths["customname"], name or "", 0, 0)
 		)
