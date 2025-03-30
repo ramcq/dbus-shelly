@@ -150,7 +150,7 @@ class Meter(object):
 	
 	async def update(self, data):
 		# NotifyStatus has power, current, voltage and energy values
-		if self.service and data.get('method') == 'NotifyStatus':
+		if self.service and data.get('method') in {'NotifyStatus', 'NotifyFullStatus'}:
 			try:
 				d = data['params']['em:0']
 			except KeyError:
@@ -183,6 +183,29 @@ class Meter(object):
 					s["/Ac/L2/Energy/Reverse"] = round(d["b_total_act_ret_energy"]/1000, 1)
 					s["/Ac/L3/Energy/Forward"] = round(d["c_total_act_energy"]/1000, 1)
 					s["/Ac/L3/Energy/Reverse"] = round(d["c_total_act_ret_energy"]/1000, 1)
+
+			try:
+				d = data['params']['switch:0']
+			except KeyError:
+				pass
+			else:
+				with self.service as s:
+					if "voltage" in d:
+						s['/Ac/L1/Voltage'] = d["voltage"]
+
+					if "current" in d:
+						s['/Ac/L1/Current'] = abs(d["current"])
+
+					if "apower" in d:
+						s['/Ac/L1/Power'] = s['/Ac/Power'] = abs(d["apower"])
+
+					aenergy = d.get("aenergy")
+					if aenergy and "total" in aenergy:
+						s["/Ac/L1/Energy/Forward"] = s["/Ac/Energy/Forward"] = round(aenergy["total"] / 1000, 1)
+
+					ret_aenergy = d.get("ret_aenergy")
+					if ret_aenergy and "total" in ret_aenergy:
+						s["/Ac/L1/Energy/Reverse"] = s["/Ac/Energy/Reverse"] = round(ret_aenergy["total"] / 1000, 1)
 
 	def role_instance(self, value):
 		val = value.split(':')
