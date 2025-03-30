@@ -57,8 +57,12 @@ class Meter(object):
 		try:
 			mac = data['result']['mac']
 			fw = data['result']['fw_id']
+			name = data['result'].get('name')
+			model = data['result'].get('app', "energy meter")
 		except KeyError:
 			return False
+
+		logger.info(f"Starting meter for device {mac} with name {name}")
 
 		# Connect to dbus, localsettings
 		bus = await MessageBus(bus_type=self.bus_type).connect()
@@ -85,7 +89,7 @@ class Meter(object):
 		await settings.add_settings(
 			Setting(self.settings_paths["instance"], f"grid:40", 0, 0),
 			Setting(self.settings_paths["position"], 0, 0, 2),
-			Setting(self.settings_paths["customname"], "", 0, 0)
+			Setting(self.settings_paths["customname"], name or "", 0, 0)
 		)
 
 		# Determine role and instance
@@ -100,13 +104,13 @@ class Meter(object):
 		self.service.add_item(TextItem('/Mgmt/Connection', f"WebSocket {host}:{port}"))
 		self.service.add_item(IntegerItem('/DeviceInstance', instance))
 		self.service.add_item(IntegerItem('/ProductId', 0xB034, text=unit_productid))
-		self.service.add_item(TextItem('/ProductName', "Shelly energy meter"))
+		self.service.add_item(TextItem('/ProductName', f"Shelly {model}"))
 		self.service.add_item(TextItem('/FirmwareVersion', fw))
 		self.service.add_item(IntegerItem('/Connected', 1))
 		self.service.add_item(IntegerItem('/RefreshTime', 100))
 
 		# Get custom name from settings
-		self.custom_name = settings.get_value(self.settings_paths["customname"])
+		self.custom_name = settings.get_value(self.settings_paths["customname"]) or name
 		self.service.add_item(TextItem('/CustomName', self.custom_name or "",
 			writeable=True, onchange=self.custom_name_changed))
 
