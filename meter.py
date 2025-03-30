@@ -34,6 +34,7 @@ class Meter(object):
 		self.service = None
 		self.position = None
 		self.destroyed = False
+		self.settings_paths = {}
 
 	async def wait_for_settings(self):
 		""" Attempt a connection to localsettings. If it does not show
@@ -63,6 +64,14 @@ class Meter(object):
 		self.monitor = await Monitor.create(bus, self.settings_changed)
 
 		settingprefix = '/Settings/Devices/shelly_' + mac
+		logger.info(f"Using settings prefix: {settingprefix}")
+
+		# Store paths for later reference
+		self.settings_paths = {
+			"instance": f"{settingprefix}/ClassAndVrmInstance",
+			"position": f"{settingprefix}/Position"
+		}
+
 		logger.info("Waiting for localsettings")
 		settings = await self.wait_for_settings()
 		if settings is None:
@@ -72,13 +81,13 @@ class Meter(object):
 		logger.info("Connected to localsettings")
 
 		await settings.add_settings(
-			Setting(settingprefix + "/ClassAndVrmInstance", "grid:40", 0, 0, alias="instance"),
-			Setting(settingprefix + '/Position', 0, 0, 2, alias="position")
+			Setting(self.settings_paths["instance"], f"grid:40", 0, 0),
+			Setting(self.settings_paths["position"], 0, 0, 2)
 		)
 
 		# Determine role and instance
 		role, instance = self.role_instance(
-			settings.get_value(settings.alias("instance")))
+			settings.get_value(self.settings_paths["instance"]))
 
 		# Set up the service
 		self.service = Service(bus, "com.victronenergy.{}.shelly_{}".format(role, mac))
@@ -100,9 +109,10 @@ class Meter(object):
 			onchange=self.role_changed))
 
 		# Position for pvinverter
+		self.position = settings.get_value(self.settings_paths["position"])
 		if role == 'pvinverter':
 			self.service.add_item(IntegerItem('/Position',
-				settings.get_value(settings.alias("position")),
+				self.position,
 				writeable=True, onchange=self.position_changed))
 
 		# Indicate when we're masquerading for another device
@@ -171,11 +181,38 @@ class Meter(object):
 		return val[0], int(val[1])
 
 	def settings_changed(self, service, values):
-		# Kill service, driver will restart us soon
-		if service.alias("instance") in values:
+		settings = self.get_settings()
+		if not settings:
+			return
+
+		# Check for position changes in pvinverter role
+		if self.settings_paths["position"] in values:
+			new_position = values[self.settings_paths["position"]]
+			self.update_position(new_position)
+
+		# Restart for role/instance changes that require restart
+		if self.settings_paths["instance"] in values:
 			self.destroy()
 
-	def role_changed(self, val):
+	def update_position(self, position):
+		"""Update the position in the service"""
+		if position == self.position:
+			return
+
+		self.position = position
+
+		settings = self.get_settings()
+		if not settings:
+			return
+
+		if self.service:
+			role, _ = self.role_instance(settings.get_value(self.settings_paths["instance"]))
+			if role == 'pvinverter':
+				with self.service as s:
+					s['/Position'] = position
+
+	async def role_changed(self, item val):
+		"""Handle role changes from the UI"""
 		if val not in ['grid', 'pvinverter', 'genset', 'acload']:
 			return False
 
@@ -183,14 +220,19 @@ class Meter(object):
 		if settings is None:
 			return False
 
-		p = settings.alias("instance")
-		role, instance = self.role_instance(settings.get_value(p))
-		settings.set_value(p, "{}:{}".format(val, instance))
+		try:
+			# For role changes we need to completely restart the service
+			_, instance = self.role_instance(settings.get_value(self.settings_paths["instance"]))
+			await settings.set_value(self.settings_paths["instance"], f"{val}:{instance}")
+			logger.info(f"Role changed to {val}, restarting service")
+			self.destroy()  # restart is necessary for role changes
+			return True
+		except Exception as e:
+			logger.error(f"Failed to change role: {e}")
+			return False
 
-		self.destroy() # restart
-		return True
-
-	def position_changed(self, val):
+	async def position_changed(self, item, val):
+		"""Handle position changes from the UI"""
 		if not 0 <= val <= 2:
 			return False
 
@@ -198,5 +240,11 @@ class Meter(object):
 		if settings is None:
 			return False
 
-		settings.set_value(settings.alias("position"), val)
-		return True
+		try:
+			# Apply to settings and update locally
+			await settings.set_value(self.settings_paths["position"], val)
+			self.update_position(val)
+			return True
+		except Exception as e:
+			logger.error(f"Failed to update position: {e}")
+			return False
