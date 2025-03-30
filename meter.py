@@ -32,6 +32,7 @@ class Meter(object):
 		self.bus_type = bus_type
 		self.monitor = None
 		self.service = None
+		self.custom_name = None
 		self.position = None
 		self.destroyed = False
 		self.settings_paths = {}
@@ -69,7 +70,8 @@ class Meter(object):
 		# Store paths for later reference
 		self.settings_paths = {
 			"instance": f"{settingprefix}/ClassAndVrmInstance",
-			"position": f"{settingprefix}/Position"
+			"position": f"{settingprefix}/Position",
+			"customname": f"{settingprefix}/CustomName"
 		}
 
 		logger.info("Waiting for localsettings")
@@ -82,7 +84,8 @@ class Meter(object):
 
 		await settings.add_settings(
 			Setting(self.settings_paths["instance"], f"grid:40", 0, 0),
-			Setting(self.settings_paths["position"], 0, 0, 2)
+			Setting(self.settings_paths["position"], 0, 0, 2),
+			Setting(self.settings_paths["customname"], "", 0, 0)
 		)
 
 		# Determine role and instance
@@ -101,6 +104,11 @@ class Meter(object):
 		self.service.add_item(TextItem('/FirmwareVersion', fw))
 		self.service.add_item(IntegerItem('/Connected', 1))
 		self.service.add_item(IntegerItem('/RefreshTime', 100))
+
+		# Get custom name from settings
+		self.custom_name = settings.get_value(self.settings_paths["customname"])
+		self.service.add_item(TextItem('/CustomName', self.custom_name or "",
+			writeable=True, onchange=self.custom_name_changed))
 
 		# Role
 		self.service.add_item(TextArrayItem('/AllowedRoles',
@@ -185,6 +193,11 @@ class Meter(object):
 		if not settings:
 			return
 
+		# Check for custom name changes
+		if self.settings_paths["customname"] in values:
+			new_name = values[self.settings_paths["customname"]]
+			self.update_custom_name(new_name)
+
 		# Check for position changes in pvinverter role
 		if self.settings_paths["position"] in values:
 			new_position = values[self.settings_paths["position"]]
@@ -193,6 +206,17 @@ class Meter(object):
 		# Restart for role/instance changes that require restart
 		if self.settings_paths["instance"] in values:
 			self.destroy()
+
+	def update_custom_name(self, name):
+		"""Update the custom name in the service"""
+		if name == self.custom_name:
+			return
+
+		self.custom_name = name
+
+		if self.service:
+			with self.service as s:
+				s['/CustomName'] = name
 
 	def update_position(self, position):
 		"""Update the position in the service"""
@@ -211,7 +235,22 @@ class Meter(object):
 				with self.service as s:
 					s['/Position'] = position
 
-	async def role_changed(self, item val):
+	async def custom_name_changed(self, item, val):
+		"""Handle custom name changes from the UI"""
+		settings = self.get_settings()
+		if settings is None:
+			return False
+
+		try:
+			# Apply the change and update locally
+			await settings.set_value(self.settings_paths["customname"], val)
+			self.update_custom_name(val)
+			return True
+		except Exception as e:
+			logger.error(f"Failed to update custom name: {e}")
+			return False
+
+	async def role_changed(self, item, val):
 		"""Handle role changes from the UI"""
 		if val not in ['grid', 'pvinverter', 'genset', 'acload']:
 			return False
