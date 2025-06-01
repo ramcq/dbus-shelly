@@ -30,6 +30,7 @@ unit_productid = lambda v: "0x{:X}".format(v)
 class Meter(object):
 	def __init__(self, bus_type):
 		self.bus_type = bus_type
+		self.bus = None
 		self.monitor = None
 		self.service = None
 		self.custom_name = None
@@ -65,8 +66,8 @@ class Meter(object):
 		logger.info(f"Starting meter for device {mac} with name {name}")
 
 		# Connect to dbus, localsettings
-		bus = await MessageBus(bus_type=self.bus_type).connect()
-		self.monitor = await Monitor.create(bus, self.settings_changed)
+		self.bus = await MessageBus(bus_type=self.bus_type).connect()
+		self.monitor = await Monitor.create(self.bus, self.settings_changed)
 
 		settingprefix = '/Settings/Devices/shelly_' + mac
 		logger.info(f"Using settings prefix: {settingprefix}")
@@ -102,7 +103,7 @@ class Meter(object):
 			settings.get_value(self.settings_paths["instance"]))
 
 		# Set up the service
-		self.service = Service(bus, "com.victronenergy.{}.shelly_{}".format(role, mac))
+		self.service = Service(self.bus, "com.victronenergy.{}.shelly_{}".format(role, mac))
 
 		self.service.add_item(TextItem('/Mgmt/ProcessName', MAIN_FILE))
 		self.service.add_item(TextItem('/Mgmt/ProcessVersion', VERSION))
@@ -152,11 +153,19 @@ class Meter(object):
 
 	def destroy(self):
 		if self.service is not None:
-			self.service.__del__()
-		self.service = None
+			del self.service
+			self.service = None
+
+		self.monitor = None
 		self.settings = None
+
+		try:
+			self.bus.disconnect()
+		finally:
+			self.bus = None
+
 		self.destroyed = True
-	
+
 	async def update(self, data):
 		# NotifyStatus has power, current, voltage and energy values
 		if self.service and data.get('method') in {'NotifyStatus', 'NotifyFullStatus'}:
