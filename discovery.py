@@ -18,15 +18,35 @@ try:
 except ImportError:
 	from dbus_next.aio import MessageBus
 
-from zeroconf import ServiceStateChange
-from zeroconf.asyncio import (
-	AsyncServiceBrowser,
-	AsyncServiceInfo,
-	AsyncZeroconf
-)
-
+# Import local modules first
 from shelly_device import ShellyDevice
 from utils import logger, wait_for_settings
+
+# Try to import zeroconf, but make it optional
+ZEROCONF_AVAILABLE = True
+try:
+	from zeroconf import ServiceStateChange
+	from zeroconf.asyncio import (
+		AsyncServiceBrowser,
+		AsyncServiceInfo,
+		AsyncZeroconf
+	)
+except ImportError:
+	logger.warning("zeroconf module not available, will use MQTT discovery only")
+	ZEROCONF_AVAILABLE = False
+
+# Try to import paho-mqtt from Venus OS paths
+MQTT_AVAILABLE = False
+for mqtt_path in ['/opt/victronenergy/dbus-mqtt', '/opt/victronenergy/mqtt-rpc']:
+	if os.path.exists(mqtt_path) and mqtt_path not in sys.path:
+		sys.path.insert(1, mqtt_path)
+
+try:
+	import paho.mqtt.client as mqtt
+	MQTT_AVAILABLE = True
+	logger.info("paho-mqtt available, MQTT discovery enabled")
+except ImportError:
+	logger.warning("paho-mqtt not available, MQTT discovery disabled")
 
 background_tasks = set()
 
@@ -43,6 +63,11 @@ class ShellyDiscovery(object):
 		self._mdns_lock = asyncio.Lock()
 		self._shelly_lock = asyncio.Lock()
 		self._enable_tasks = {}
+		# MQTT discovery
+		self.mqtt_client = None
+		self._mqtt_lock = asyncio.Lock()
+		self._mqtt_pending_queries = {}  # Maps request_id to asyncio.Future
+		self._mqtt_request_id = 0
 
 	async def start(self):
 		# Connect to dbus, localsettings
@@ -54,18 +79,35 @@ class ShellyDiscovery(object):
 		# Set up the service
 		self.service = Service(self.bus, "com.victronenergy.shelly")
 		await self.settings.add_settings(Setting('/Settings/Shelly/IpAddresses', "", alias="ipaddresses"))
+		await self.settings.add_settings(Setting('/Settings/Shelly/MqttBroker', "localhost", alias="mqttbroker"))
 
 		ip_addresses = self.settings.get_value(self.settings.alias('ipaddresses'))
+		mqtt_broker = self.settings.get_value(self.settings.alias('mqttbroker'))
 
 		self.service.add_item(IntegerItem('/Refresh', 0, writeable=True,
 			onchange=self.refresh))
 		self.service.add_item(TextItem('/IpAddresses', ip_addresses, writeable=True, onchange=self._on_ip_addresses_changed))
+		self.service.add_item(TextItem('/MqttBroker', mqtt_broker, writeable=True, onchange=self._on_mqtt_broker_changed))
 		await self.service.register()
 
-		self.aiozc = AsyncZeroconf()
-		self.aiobrowser = AsyncServiceBrowser(
-			self.aiozc.zeroconf, ["_shelly._tcp.local."], handlers=[self.on_service_state_change]
-		)
+		# Start zeroconf discovery if available
+		if ZEROCONF_AVAILABLE:
+			try:
+				self.aiozc = AsyncZeroconf()
+				self.aiobrowser = AsyncServiceBrowser(
+					self.aiozc.zeroconf, ["_shelly._tcp.local."], handlers=[self.on_service_state_change]
+				)
+				logger.info("mDNS discovery started")
+			except Exception as e:
+				logger.error("Failed to start mDNS discovery: %s", e)
+		else:
+			logger.info("mDNS discovery not available")
+
+		# Start MQTT discovery if available
+		if MQTT_AVAILABLE:
+			await self._start_mqtt_discovery(mqtt_broker)
+		else:
+			logger.info("MQTT discovery not available")
 
 		self._start_add_by_ip_address_task(ip_addresses)
 
@@ -140,16 +182,200 @@ class ShellyDiscovery(object):
 				elif serial in self.shellies:
 					# Try reconnecting if enabled.
 					self.shellies[serial]['device'].do_reconnect()
-			async with self._mdns_lock:
-				if self.aiobrowser is not None:
-					await self.aiobrowser.async_cancel()
-				self.aiobrowser = AsyncServiceBrowser(
-					self.aiozc.zeroconf, ["_shelly._tcp.local."], handlers=[self.on_service_state_change]
-				)
+
+			# Restart mDNS discovery if available
+			if ZEROCONF_AVAILABLE and self.aiozc is not None:
+				async with self._mdns_lock:
+					if self.aiobrowser is not None:
+						await self.aiobrowser.async_cancel()
+					self.aiobrowser = AsyncServiceBrowser(
+						self.aiozc.zeroconf, ["_shelly._tcp.local."], handlers=[self.on_service_state_change]
+					)
 
 			# Retry adding the manually added IP addresses
 			self._start_add_by_ip_address_task(self.settings.get_value(self.settings.alias('ipaddresses')))
 		item.set_local_value(0)
+
+	async def _on_mqtt_broker_changed(self, item, value):
+		"""Handle MQTT broker setting changes."""
+		if not MQTT_AVAILABLE:
+			return
+
+		if value != self.settings.get_value(self.settings.alias('mqttbroker')):
+			await self.settings.set_value(self.settings.alias('mqttbroker'), value)
+		item.set_local_value(value)
+
+		# Restart MQTT discovery with new broker
+		if self.mqtt_client is not None:
+			self.mqtt_client.disconnect()
+		await self._start_mqtt_discovery(value)
+
+	async def _start_mqtt_discovery(self, broker):
+		"""Initialize MQTT client and start discovery."""
+		if not MQTT_AVAILABLE:
+			return
+
+		try:
+			import json
+			self._json = json
+
+			# Create MQTT client
+			self.mqtt_client = mqtt.Client(client_id="dbus-shelly-discovery", protocol=mqtt.MQTTv311)
+			self.mqtt_client.on_connect = self._mqtt_on_connect
+			self.mqtt_client.on_message = self._mqtt_on_message
+
+			# Connect to broker
+			logger.info("Connecting to MQTT broker at %s", broker)
+			self.mqtt_client.connect_async(broker, 1883, 60)
+			self.mqtt_client.loop_start()
+
+		except Exception as e:
+			logger.error("Failed to start MQTT discovery: %s", e)
+
+	def _mqtt_on_connect(self, client, userdata, flags, rc):
+		"""Called when MQTT client connects to broker."""
+		if rc == 0:
+			logger.info("Connected to MQTT broker")
+			# Subscribe to wildcard topic to discover all Shelly devices
+			# Gen2+ devices publish to <device_id>/online when they connect
+			client.subscribe("+/online", qos=0)
+			# Also subscribe to our RPC response topic
+			client.subscribe("dbus-shelly-discovery/rpc", qos=0)
+			logger.info("Subscribed to +/online and dbus-shelly-discovery/rpc")
+		else:
+			logger.error("Failed to connect to MQTT broker, rc=%d", rc)
+
+	def _mqtt_on_message(self, client, userdata, msg):
+		"""Called when MQTT message is received."""
+		try:
+			topic = msg.topic
+			payload = msg.payload.decode('utf-8')
+
+			# Handle device online messages
+			if topic.endswith('/online'):
+				device_id = topic[:-7]  # Remove '/online' suffix
+				if payload.lower() == 'true':
+					# Device is online, query it for details
+					task = asyncio.create_task(self._mqtt_handle_online(device_id))
+					background_tasks.add(task)
+					task.add_done_callback(background_tasks.discard)
+
+			# Handle RPC responses
+			elif topic == "dbus-shelly-discovery/rpc":
+				try:
+					data = self._json.loads(payload)
+					task = asyncio.create_task(self._mqtt_handle_rpc_response(data))
+					background_tasks.add(task)
+					task.add_done_callback(background_tasks.discard)
+				except Exception as e:
+					logger.error("Failed to parse RPC response: %s", e)
+
+		except Exception as e:
+			logger.error("Error handling MQTT message: %s", e)
+
+	async def _mqtt_handle_online(self, device_id):
+		"""Handle device online announcement."""
+		try:
+			# Check if device ID matches Shelly pattern
+			# Gen2 devices: shellyplus*/shellypro* followed by model and MAC
+			if not (device_id.startswith('shellyplus') or device_id.startswith('shellypro')):
+				return
+
+			# Extract MAC address from device ID (last 12 characters)
+			mac = device_id.split('-')[-1] if '-' in device_id else None
+			if not mac or len(mac) != 12:
+				return
+
+			# Check if we already discovered this device
+			if mac in self.discovered_devices or mac in self.saved_devices:
+				logger.debug("Device %s already discovered", device_id)
+				return
+
+			logger.info("Discovered new Shelly device via MQTT: %s", device_id)
+
+			# Query device for details via MQTT RPC
+			ip = await self._mqtt_query_device(device_id, "Shelly.GetStatus")
+
+			if ip:
+				# Add device with the discovered IP
+				await self._add_device(ip, serial=mac, manual=False, discovery_type='MQTT')
+
+		except Exception as e:
+			logger.error("Error handling device online for %s: %s", device_id, e)
+
+	async def _mqtt_query_device(self, device_id, method, params=None):
+		"""Query a Shelly device via MQTT RPC and return IP address if available."""
+		if not MQTT_AVAILABLE or self.mqtt_client is None:
+			return None
+
+		try:
+			# Generate unique request ID
+			self._mqtt_request_id += 1
+			request_id = self._mqtt_request_id
+
+			# Create RPC request
+			rpc_request = {
+				"id": request_id,
+				"src": "dbus-shelly-discovery",
+				"method": method
+			}
+			if params:
+				rpc_request["params"] = params
+
+			# Create future to wait for response
+			future = asyncio.Future()
+			self._mqtt_pending_queries[request_id] = future
+
+			# Publish request
+			topic = f"{device_id}/rpc"
+			payload = self._json.dumps(rpc_request)
+			self.mqtt_client.publish(topic, payload, qos=0)
+
+			logger.debug("Sent MQTT RPC request to %s: %s", device_id, method)
+
+			# Wait for response with timeout
+			try:
+				response = await asyncio.wait_for(future, timeout=5.0)
+
+				# Extract IP address from response
+				# Response should have eth.ip or wifi.ip in the result
+				if response and 'result' in response:
+					result = response['result']
+					# Try ethernet first
+					if 'eth' in result and result['eth'] and 'ip' in result['eth']:
+						return result['eth']['ip']
+					# Try wifi
+					if 'wifi' in result and result['wifi'] and 'ip' in result['wifi']:
+						return result['wifi']['ip']
+					# Try sys component (some devices)
+					if 'sys' in result and 'available_updates' in result:
+						# This is a full status, look for network info
+						for key in result:
+							if isinstance(result[key], dict):
+								if 'ip' in result[key] and result[key]['ip']:
+									return result[key]['ip']
+
+			except asyncio.TimeoutError:
+				logger.warning("Timeout waiting for MQTT RPC response from %s", device_id)
+			finally:
+				# Clean up pending query
+				self._mqtt_pending_queries.pop(request_id, None)
+
+		except Exception as e:
+			logger.error("Error querying device %s via MQTT: %s", device_id, e)
+
+		return None
+
+	async def _mqtt_handle_rpc_response(self, data):
+		"""Handle RPC response from device."""
+		try:
+			request_id = data.get('id')
+			if request_id in self._mqtt_pending_queries:
+				future = self._mqtt_pending_queries.get(request_id)
+				if future and not future.done():
+					future.set_result(data)
+		except Exception as e:
+			logger.error("Error handling RPC response: %s", e)
 
 	def remove_discovered_device(self, serial):
 		if serial in self.discovered_devices:
@@ -226,10 +452,20 @@ class ShellyDiscovery(object):
 		pass
 
 	async def stop(self):
-		assert self.aiozc is not None
-		assert self.aiobrowser is not None
-		await self.aiobrowser.async_cancel()
-		await self.aiozc.async_close()
+		# Stop MQTT discovery if active
+		if MQTT_AVAILABLE and self.mqtt_client is not None:
+			try:
+				self.mqtt_client.loop_stop()
+				self.mqtt_client.disconnect()
+			except Exception as e:
+				logger.error("Error stopping MQTT client: %s", e)
+
+		# Stop zeroconf discovery if active
+		if ZEROCONF_AVAILABLE:
+			if self.aiobrowser is not None:
+				await self.aiobrowser.async_cancel()
+			if self.aiozc is not None:
+				await self.aiozc.async_close()
 
 	async def _shelly_event_monitor(self, event, shelly):
 		serial = shelly.serial
@@ -298,7 +534,7 @@ class ShellyDiscovery(object):
 			task.add_done_callback(background_tasks.discard)
 			background_tasks.add(task)
 
-	async def _add_device(self, server, serial=None, manual=False):
+	async def _add_device(self, server, serial=None, manual=False, discovery_type=None):
 		ip, device_info, num_channels = await self._get_device_info(server, serial)
 		if device_info is None:
 			logger.error("Failed to get device info for %s", server)
@@ -321,12 +557,16 @@ class ShellyDiscovery(object):
 			if self.service.get_item('/Devices/{}/{}'.format(serial, p)) is None:
 				self.service.add_item(TextItem('/Devices/{}/{}'.format(serial, p), writeable=False))
 
+		# Determine discovery type
+		if discovery_type is None:
+			discovery_type = 'Manual' if manual else 'mDNS'
+
 		with self.service as s:
 			s['/Devices/{}/Ip'.format(serial)] = ip
 			s['/Devices/{}/Mac'.format(serial)] = serial
 			s['/Devices/{}/Model'.format(serial)] = model_name
 			s['/Devices/{}/Name'.format(serial)] = name
-			s['/Devices/{}/DiscoveryType'.format(serial)] = 'Manual' if manual else 'mDNS'
+			s['/Devices/{}/DiscoveryType'.format(serial)] = discovery_type
 
 		for i in range(num_channels):
 			await self.settings.add_settings(Setting('/Settings/Devices/shelly_{}/{}/Enabled'.format(serial, i + 1), 0, alias="enabled_{}_{}".format(serial, i)))
