@@ -66,8 +66,7 @@ class ShellyDiscovery(object):
 		# MQTT discovery
 		self.mqtt_client = None
 		self._mqtt_lock = asyncio.Lock()
-		self._mqtt_pending_queries = {}  # Maps request_id to asyncio.Future
-		self._mqtt_request_id = 0
+		self._pending_mqtt_devices = {}  # Maps device_id to pending device info
 
 	async def start(self):
 		# Connect to dbus, localsettings
@@ -79,15 +78,12 @@ class ShellyDiscovery(object):
 		# Set up the service
 		self.service = Service(self.bus, "com.victronenergy.shelly")
 		await self.settings.add_settings(Setting('/Settings/Shelly/IpAddresses', "", alias="ipaddresses"))
-		await self.settings.add_settings(Setting('/Settings/Shelly/MqttBroker', "localhost", alias="mqttbroker"))
 
 		ip_addresses = self.settings.get_value(self.settings.alias('ipaddresses'))
-		mqtt_broker = self.settings.get_value(self.settings.alias('mqttbroker'))
 
 		self.service.add_item(IntegerItem('/Refresh', 0, writeable=True,
 			onchange=self.refresh))
 		self.service.add_item(TextItem('/IpAddresses', ip_addresses, writeable=True, onchange=self._on_ip_addresses_changed))
-		self.service.add_item(TextItem('/MqttBroker', mqtt_broker, writeable=True, onchange=self._on_mqtt_broker_changed))
 		await self.service.register()
 
 		# Start zeroconf discovery if available
@@ -103,9 +99,9 @@ class ShellyDiscovery(object):
 		else:
 			logger.info("mDNS discovery not available")
 
-		# Start MQTT discovery if available
+		# Start MQTT discovery if available (Venus OS always has MQTT broker on localhost)
 		if MQTT_AVAILABLE:
-			await self._start_mqtt_discovery(mqtt_broker)
+			await self._start_mqtt_discovery()
 		else:
 			logger.info("MQTT discovery not available")
 
@@ -196,21 +192,7 @@ class ShellyDiscovery(object):
 			self._start_add_by_ip_address_task(self.settings.get_value(self.settings.alias('ipaddresses')))
 		item.set_local_value(0)
 
-	async def _on_mqtt_broker_changed(self, item, value):
-		"""Handle MQTT broker setting changes."""
-		if not MQTT_AVAILABLE:
-			return
-
-		if value != self.settings.get_value(self.settings.alias('mqttbroker')):
-			await self.settings.set_value(self.settings.alias('mqttbroker'), value)
-		item.set_local_value(value)
-
-		# Restart MQTT discovery with new broker
-		if self.mqtt_client is not None:
-			self.mqtt_client.disconnect()
-		await self._start_mqtt_discovery(value)
-
-	async def _start_mqtt_discovery(self, broker):
+	async def _start_mqtt_discovery(self):
 		"""Initialize MQTT client and start discovery."""
 		if not MQTT_AVAILABLE:
 			return
@@ -224,9 +206,9 @@ class ShellyDiscovery(object):
 			self.mqtt_client.on_connect = self._mqtt_on_connect
 			self.mqtt_client.on_message = self._mqtt_on_message
 
-			# Connect to broker
-			logger.info("Connecting to MQTT broker at %s", broker)
-			self.mqtt_client.connect_async(broker, 1883, 60)
+			# Connect to Venus OS MQTT broker (always on localhost)
+			logger.info("Connecting to MQTT broker at localhost")
+			self.mqtt_client.connect_async("localhost", 1883, 60)
 			self.mqtt_client.loop_start()
 
 		except Exception as e:
@@ -236,12 +218,16 @@ class ShellyDiscovery(object):
 		"""Called when MQTT client connects to broker."""
 		if rc == 0:
 			logger.info("Connected to MQTT broker")
-			# Subscribe to wildcard topic to discover all Shelly devices
-			# Gen2+ devices publish to <device_id>/online when they connect
+			# Subscribe to announce topics (Gen2 devices with MQTT control enabled)
+			client.subscribe("shellies/announce", qos=0)
+			client.subscribe("+/announce", qos=0)
+			# Also subscribe to online for passive discovery
 			client.subscribe("+/online", qos=0)
-			# Also subscribe to our RPC response topic
-			client.subscribe("dbus-shelly-discovery/rpc", qos=0)
-			logger.info("Subscribed to +/online and dbus-shelly-discovery/rpc")
+			logger.info("Subscribed to shellies/announce, +/announce, and +/online")
+
+			# Trigger discovery by sending announce command
+			logger.info("Sending announce command to discover devices")
+			client.publish("shellies/command", "announce", qos=0)
 		else:
 			logger.error("Failed to connect to MQTT broker, rc=%d", rc)
 
@@ -251,39 +237,66 @@ class ShellyDiscovery(object):
 			topic = msg.topic
 			payload = msg.payload.decode('utf-8')
 
-			# Handle device online messages
-			if topic.endswith('/online'):
-				device_id = topic[:-7]  # Remove '/online' suffix
-				if payload.lower() == 'true':
-					# Device is online, query it for details
-					task = asyncio.create_task(self._mqtt_handle_online(device_id))
-					background_tasks.add(task)
-					task.add_done_callback(background_tasks.discard)
-
-			# Handle RPC responses
-			elif topic == "dbus-shelly-discovery/rpc":
+			# Handle announce messages (Shelly.GetDeviceInfo data)
+			if topic == "shellies/announce" or topic.endswith('/announce'):
 				try:
 					data = self._json.loads(payload)
-					task = asyncio.create_task(self._mqtt_handle_rpc_response(data))
+					task = asyncio.create_task(self._mqtt_handle_announce(data))
 					background_tasks.add(task)
 					task.add_done_callback(background_tasks.discard)
 				except Exception as e:
-					logger.error("Failed to parse RPC response: %s", e)
+					logger.error("Failed to parse announce message: %s", e)
+
+			# Handle status messages (to get IP address)
+			elif '/status' in topic:
+				try:
+					data = self._json.loads(payload)
+					# Extract device_id from topic (format: <device_id>/status/... or <device_id>/status)
+					device_id = topic.split('/status')[0]
+					task = asyncio.create_task(self._mqtt_handle_status(device_id, data))
+					background_tasks.add(task)
+					task.add_done_callback(background_tasks.discard)
+				except Exception as e:
+					logger.error("Failed to parse status message: %s", e)
+
+			# Handle device online messages (passive discovery)
+			elif topic.endswith('/online'):
+				device_id = topic[:-7]  # Remove '/online' suffix
+				if payload.lower() == 'true':
+					# Device came online, send announce to get its details
+					if device_id.startswith('shellyplus') or device_id.startswith('shellypro'):
+						logger.debug("Device %s online, requesting announce", device_id)
+						client.publish(f"{device_id}/command", "announce", qos=0)
 
 		except Exception as e:
 			logger.error("Error handling MQTT message: %s", e)
 
-	async def _mqtt_handle_online(self, device_id):
-		"""Handle device online announcement."""
+	async def _mqtt_handle_announce(self, data):
+		"""
+		Handle device announce message.
+
+		Announce data contains Shelly.GetDeviceInfo response with fields:
+		- id: device identifier (e.g., "shellypro4pm-84cca87c1f90")
+		- mac: MAC address (e.g., "84CCA87C1F90")
+		- model: model name (e.g., "SPSW-004PE16EU")
+		- gen: generation (e.g., 2)
+		- fw_id: firmware build ID
+		- ver: firmware version
+		- app: application name (e.g., "Pro4PM")
+		- profile: device profile (if applicable)
+		"""
 		try:
-			# Check if device ID matches Shelly pattern
-			# Gen2 devices: shellyplus*/shellypro* followed by model and MAC
+			# Extract device information from announce
+			device_id = data.get('id', '')
+			mac = data.get('mac', '').replace(':', '').lower()
+
+			# Check if this is a Gen2+ device
 			if not (device_id.startswith('shellyplus') or device_id.startswith('shellypro')):
+				logger.debug("Ignoring non-Gen2 device: %s", device_id)
 				return
 
-			# Extract MAC address from device ID (last 12 characters)
-			mac = device_id.split('-')[-1] if '-' in device_id else None
 			if not mac or len(mac) != 12:
+				logger.warning("Invalid MAC address in announce from %s", device_id)
 				return
 
 			# Check if we already discovered this device
@@ -291,91 +304,68 @@ class ShellyDiscovery(object):
 				logger.debug("Device %s already discovered", device_id)
 				return
 
-			logger.info("Discovered new Shelly device via MQTT: %s", device_id)
+			logger.info("Discovered new Shelly device via MQTT announce: %s (MAC: %s)", device_id, mac)
 
-			# Query device for details via MQTT RPC
-			ip = await self._mqtt_query_device(device_id, "Shelly.GetStatus")
+			# We need to connect via WebSocket to get full device info and IP
+			# The announce doesn't include IP, so we need to derive it or query it
+			# For now, we'll try to query the device status to get the IP
+			# by sending status_update command and subscribing to its status
+
+			# Subscribe to device status to get IP address
+			if self.mqtt_client:
+				# Subscribe to this specific device's status
+				self.mqtt_client.subscribe(f"{device_id}/status/sys", qos=0)
+				self.mqtt_client.subscribe(f"{device_id}/status", qos=0)
+				# Request status update
+				self.mqtt_client.publish(f"{device_id}/command", "status_update", qos=0)
+
+				# Store the device info for when we receive the status
+				self._pending_mqtt_devices[device_id] = {
+					'mac': mac,
+					'data': data
+				}
+
+		except Exception as e:
+			logger.error("Error handling announce: %s", e)
+
+	async def _mqtt_handle_status(self, device_id, data):
+		"""
+		Handle device status message to extract IP address.
+
+		Status messages are published on <device_id>/status or <device_id>/status/<component>
+		and contain network configuration with IP addresses.
+		"""
+		try:
+			# Check if this device is pending (we requested its status)
+			if device_id not in self._pending_mqtt_devices:
+				return
+
+			pending = self._pending_mqtt_devices[device_id]
+			mac = pending['mac']
+
+			# Extract IP address from status data
+			# Status contains components like 'eth', 'wifi', 'sys' with network info
+			ip = None
+
+			# Try to find IP in various fields
+			if 'ip' in data:
+				ip = data['ip']
+			elif 'eth' in data and isinstance(data['eth'], dict) and 'ip' in data['eth']:
+				ip = data['eth']['ip']
+			elif 'wifi' in data and isinstance(data['wifi'], dict) and 'ip' in data['wifi']:
+				ip = data['wifi']['ip']
 
 			if ip:
-				# Add device with the discovered IP
+				logger.info("Found IP %s for device %s via MQTT status", ip, device_id)
+				# Remove from pending
+				del self._pending_mqtt_devices[device_id]
+				# Add the device
 				await self._add_device(ip, serial=mac, manual=False, discovery_type='MQTT')
+			else:
+				logger.debug("No IP found in status message from %s", device_id)
 
 		except Exception as e:
-			logger.error("Error handling device online for %s: %s", device_id, e)
-
-	async def _mqtt_query_device(self, device_id, method, params=None):
-		"""Query a Shelly device via MQTT RPC and return IP address if available."""
-		if not MQTT_AVAILABLE or self.mqtt_client is None:
-			return None
-
-		try:
-			# Generate unique request ID
-			self._mqtt_request_id += 1
-			request_id = self._mqtt_request_id
-
-			# Create RPC request
-			rpc_request = {
-				"id": request_id,
-				"src": "dbus-shelly-discovery",
-				"method": method
-			}
-			if params:
-				rpc_request["params"] = params
-
-			# Create future to wait for response
-			future = asyncio.Future()
-			self._mqtt_pending_queries[request_id] = future
-
-			# Publish request
-			topic = f"{device_id}/rpc"
-			payload = self._json.dumps(rpc_request)
-			self.mqtt_client.publish(topic, payload, qos=0)
-
-			logger.debug("Sent MQTT RPC request to %s: %s", device_id, method)
-
-			# Wait for response with timeout
-			try:
-				response = await asyncio.wait_for(future, timeout=5.0)
-
-				# Extract IP address from response
-				# Response should have eth.ip or wifi.ip in the result
-				if response and 'result' in response:
-					result = response['result']
-					# Try ethernet first
-					if 'eth' in result and result['eth'] and 'ip' in result['eth']:
-						return result['eth']['ip']
-					# Try wifi
-					if 'wifi' in result and result['wifi'] and 'ip' in result['wifi']:
-						return result['wifi']['ip']
-					# Try sys component (some devices)
-					if 'sys' in result and 'available_updates' in result:
-						# This is a full status, look for network info
-						for key in result:
-							if isinstance(result[key], dict):
-								if 'ip' in result[key] and result[key]['ip']:
-									return result[key]['ip']
-
-			except asyncio.TimeoutError:
-				logger.warning("Timeout waiting for MQTT RPC response from %s", device_id)
-			finally:
-				# Clean up pending query
-				self._mqtt_pending_queries.pop(request_id, None)
-
-		except Exception as e:
-			logger.error("Error querying device %s via MQTT: %s", device_id, e)
-
-		return None
-
-	async def _mqtt_handle_rpc_response(self, data):
-		"""Handle RPC response from device."""
-		try:
-			request_id = data.get('id')
-			if request_id in self._mqtt_pending_queries:
-				future = self._mqtt_pending_queries.get(request_id)
-				if future and not future.done():
-					future.set_result(data)
-		except Exception as e:
-			logger.error("Error handling RPC response: %s", e)
+			logger.error("Error handling status from %s: %s", device_id, e)
 
 	def remove_discovered_device(self, serial):
 		if serial in self.discovered_devices:
